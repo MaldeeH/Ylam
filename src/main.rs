@@ -16,7 +16,6 @@ struct Config {
     dotfiles: Vec<String>,
     done_color: String,
     attention_color: String,
-    running_color: String,
     failed_color: String,
     agents: BTreeMap<String, String>,
 }
@@ -26,7 +25,7 @@ struct Repo {
     root: PathBuf,
     key: String,
     state: PathBuf,
-    worktrees: PathBuf,
+    parent: PathBuf,
 }
 
 struct State {
@@ -63,6 +62,7 @@ fn run() -> Result<()> {
         Some("list") => cmd_list(),
         Some("refresh") => cmd_refresh(&config),
         Some("event") => cmd_event(&config, args.get(2).ok_or("missing event")?),
+        Some("remove") => cmd_remove(args.get(2).ok_or("missing workspace id or all")?),
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -77,6 +77,7 @@ fn print_help() {
     println!("  ylam list");
     println!("  ylam refresh");
     println!("  ylam event <event>");
+    println!("  ylam remove <wtN|all>");
 }
 
 fn parse_agent(args: &[String]) -> Result<Option<String>> {
@@ -97,58 +98,72 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
     require_tmux()?;
     let repo = repo()?;
     let mut state = load_state(&repo)?;
-    let id = next_id(&state);
-    let branch = format!("{}-{}", id, clean_name(&repo.name));
-    let path = repo.worktrees.join(&id);
     let agent = agent.unwrap_or_else(|| config.default_agent.clone());
     let agent_cmd = config
         .agents
         .get(&agent)
         .ok_or_else(|| format!("unknown agent: {agent}"))?
         .clone();
+    let live_windows = tmux_windows()?;
+    let id = next_closed_id(&state, &live_windows);
 
-    if branch_exists(&repo.root, &branch)? {
-        return Err(format!("branch already exists: {branch}").into());
-    }
-    if path.exists() {
-        return Err(format!("worktree already exists: {}", path.display()).into());
+    if !state.workspaces.contains_key(&id) {
+        if id == "main" {
+            let now = now();
+            state.workspaces.insert(
+                id.clone(),
+                Workspace {
+                    branch: config.main_branch.clone(),
+                    path: repo.root.clone(),
+                    agent: agent.clone(),
+                    tmux_window_id: String::new(),
+                    status: "created".into(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            );
+        } else {
+            create_worktree(&repo, &config.main_branch, &id)?;
+            copy_dotfiles(
+                &repo.root,
+                &repo.parent.join(format!("{}-{}", repo.name, id)),
+                &config.dotfiles,
+            )?;
+            let now = now();
+            state.workspaces.insert(
+                id.clone(),
+                Workspace {
+                    branch: format!("{}-{}", id, clean_name(&repo.name)),
+                    path: repo.parent.join(format!("{}-{}", repo.name, id)),
+                    agent: agent.clone(),
+                    tmux_window_id: String::new(),
+                    status: "created".into(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            );
+        }
     }
 
-    fs::create_dir_all(&repo.worktrees)?;
-    sh(Command::new("git")
-        .arg("-C")
-        .arg(&repo.root)
-        .arg("worktree")
-        .arg("add")
-        .arg("-b")
-        .arg(&branch)
-        .arg(&path)
-        .arg(&config.main_branch))?;
-    copy_dotfiles(&repo.root, &path, &config.dotfiles)?;
+    let workspace = state.workspaces.get_mut(&id).ok_or("workspace missing")?;
+    if id != "main" && !workspace.path.exists() {
+        create_worktree(&repo, &config.main_branch, &id)?;
+        workspace.branch = format!("{}-{}", id, clean_name(&repo.name));
+        workspace.path = repo.parent.join(format!("{}-{}", repo.name, id));
+        copy_dotfiles(&repo.root, &workspace.path, &config.dotfiles)?;
+    }
 
     let name = format!("{}:{}", id, repo.name);
-    let window = tmux_new(
-        &name,
-        &path,
-        &config.editor,
-        &agent_cmd,
-        &config.running_color,
-    )?;
+    let window = tmux_new(&name, &workspace.path, &config.editor, &agent_cmd)?;
     let now = now();
-    state.workspaces.insert(
-        id.clone(),
-        Workspace {
-            branch: branch.clone(),
-            path: path.clone(),
-            agent,
-            tmux_window_id: window.clone(),
-            status: "running".into(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    );
+    workspace.agent = agent;
+    workspace.tmux_window_id = window.clone();
+    workspace.status = "running".into();
+    workspace.updated_at = now;
+    let path = workspace.path.clone();
+    let branch = workspace.branch.clone();
     save_state(&repo.state, &state)?;
-    println!("created {id} {branch} {} {window}", path.display());
+    println!("opened {id} {branch} {} {window}", path.display());
     Ok(())
 }
 
@@ -181,6 +196,9 @@ fn cmd_refresh(config: &Config) -> Result<()> {
     let repo = repo()?;
     let state = read_state_file(&repo.state)?;
     for (id, w) in state.workspaces {
+        if id == "main" {
+            continue;
+        }
         println!("refreshing {id}: {} <- {}", w.branch, config.main_branch);
         sh(Command::new("git")
             .arg("-C")
@@ -193,6 +211,31 @@ fn cmd_refresh(config: &Config) -> Result<()> {
             .arg("merge")
             .arg(&config.main_branch))?;
     }
+    Ok(())
+}
+
+fn cmd_remove(target: &str) -> Result<()> {
+    let repo = repo()?;
+    let mut state = read_state_file(&repo.state)?;
+    let ids: Vec<String> = if target == "all" {
+        state.workspaces.keys().cloned().collect()
+    } else if state.workspaces.contains_key(target) {
+        vec![target.to_string()]
+    } else {
+        return Err(format!("unknown workspace: {target}").into());
+    };
+
+    for id in ids {
+        let w = state.workspaces.remove(&id).ok_or("workspace missing")?;
+        remove_worktree(&repo.root, &w)?;
+        if id == "main" {
+            println!("removed main from ylam state");
+        } else {
+            println!("removed {id} {}", w.path.display());
+        }
+    }
+
+    save_state(&repo.state, &state)?;
     Ok(())
 }
 
@@ -217,19 +260,22 @@ fn cmd_event(config: &Config, event: &str) -> Result<()> {
         "running" => None,
         _ => Some("ATTN"),
     };
-    let color = match event {
-        "agent-done" | "done" => &config.done_color,
-        "permission-requested" | "attention" => &config.attention_color,
-        "failed" | "fail" => &config.failed_color,
-        "running" => &config.running_color,
-        _ => &config.attention_color,
-    };
     let name = match marker {
         Some(m) => format!("{id}:{repo_name}:{m}"),
         None => format!("{id}:{repo_name}"),
     };
 
-    tmux_color(&window, color, &name)?;
+    if event == "running" {
+        tmux_rename(&window, &name)?;
+    } else {
+        let color = match event {
+            "agent-done" | "done" => &config.done_color,
+            "permission-requested" | "attention" => &config.attention_color,
+            "failed" | "fail" => &config.failed_color,
+            _ => &config.attention_color,
+        };
+        tmux_color(&window, color, &name)?;
+    }
     save_state(&state_path, &state)?;
     println!("updated {id} to {event}");
     Ok(())
@@ -246,9 +292,8 @@ fn load_config() -> Config {
             ".claude".into(),
             ".codex".into(),
         ],
-        done_color: "green".into(),
+        done_color: "brightyellow".into(),
         attention_color: "yellow".into(),
-        running_color: "cyan".into(),
         failed_color: "red".into(),
         agents: BTreeMap::from([
             ("claude".into(), "claude".into()),
@@ -283,7 +328,6 @@ fn load_config() -> Config {
             ("dotfiles", "paths") => c.dotfiles = parse_array(value),
             ("tmux", "done_color") => c.done_color = unquote(value),
             ("tmux", "attention_color") => c.attention_color = unquote(value),
-            ("tmux", "running_color") => c.running_color = unquote(value),
             ("tmux", "failed_color") => c.failed_color = unquote(value),
             (s, "command") if s.starts_with("agents.") => {
                 c.agents
@@ -311,12 +355,16 @@ fn repo() -> Result<Repo> {
         hash(root.to_string_lossy().as_ref())
     );
     let base = data_root().join("repos").join(&key);
+    let parent = root
+        .parent()
+        .ok_or("repo root has no parent directory")?
+        .to_path_buf();
     Ok(Repo {
         name,
         root,
         key,
         state: base.join("state.txt"),
-        worktrees: base.join("worktrees"),
+        parent,
     })
 }
 
@@ -328,7 +376,7 @@ fn load_state(repo: &Repo) -> Result<State> {
             repo_name: repo.name.clone(),
             repo_root: repo.root.clone(),
             repo_key: repo.key.clone(),
-            worktree_root: repo.worktrees.clone(),
+            worktree_root: repo.parent.clone(),
             workspaces: BTreeMap::new(),
         })
     }
@@ -401,14 +449,24 @@ fn save_state(path: &Path, state: &State) -> Result<()> {
     Ok(())
 }
 
-fn next_id(state: &State) -> String {
+fn next_closed_id(state: &State, live_windows: &[String]) -> String {
+    if !workspace_is_open(state.workspaces.get("main"), live_windows) {
+        return "main".into();
+    }
+
     for n in 1.. {
         let id = format!("wt{n}");
-        if !state.workspaces.contains_key(&id) {
+        if !workspace_is_open(state.workspaces.get(&id), live_windows) {
             return id;
         }
     }
     unreachable!()
+}
+
+fn workspace_is_open(workspace: Option<&Workspace>, live_windows: &[String]) -> bool {
+    workspace
+        .map(|w| live_windows.contains(&w.tmux_window_id))
+        .unwrap_or(false)
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
@@ -421,6 +479,58 @@ fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
         .arg(format!("refs/heads/{branch}"))
         .status()?
         .success())
+}
+
+fn create_worktree(repo: &Repo, main_branch: &str, id: &str) -> Result<()> {
+    let branch = format!("{}-{}", id, clean_name(&repo.name));
+    let path = repo.parent.join(format!("{}-{}", repo.name, id));
+    if path.exists() {
+        return Err(format!("worktree already exists: {}", path.display()).into());
+    }
+
+    if branch_exists(&repo.root, &branch)? {
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .arg("worktree")
+            .arg("add")
+            .arg(&path)
+            .arg(&branch))
+    } else {
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(&branch)
+            .arg(&path)
+            .arg(main_branch))
+    }
+}
+
+fn remove_worktree(repo: &Path, w: &Workspace) -> Result<()> {
+    if w.path == repo {
+        return Ok(());
+    }
+    if w.path.exists() {
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(&w.path))?;
+    }
+    if branch_exists(repo, &w.branch)? {
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("branch")
+            .arg("-D")
+            .arg(&w.branch))?;
+    }
+    Ok(())
 }
 
 fn copy_dotfiles(repo: &Path, worktree: &Path, paths: &[String]) -> Result<()> {
@@ -458,7 +568,7 @@ fn copy(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tmux_new(name: &str, dir: &Path, editor: &str, agent: &str, color: &str) -> Result<String> {
+fn tmux_new(name: &str, dir: &Path, editor: &str, agent: &str) -> Result<String> {
     let window = out(Command::new("tmux")
         .arg("new-window")
         .arg("-P")
@@ -484,19 +594,20 @@ fn tmux_new(name: &str, dir: &Path, editor: &str, agent: &str, color: &str) -> R
         .arg(&window)
         .arg("-c")
         .arg(dir))?;
+    let dir = shell_quote(&dir.to_string_lossy());
     sh(Command::new("tmux")
         .arg("send-keys")
         .arg("-t")
         .arg(&left)
-        .arg(editor)
+        .arg(format!("cd {dir} && {editor} ."))
         .arg("C-m"))?;
     sh(Command::new("tmux")
         .arg("send-keys")
         .arg("-t")
         .arg(&right)
-        .arg(agent)
+        .arg(format!("cd {dir} && {agent}"))
         .arg("C-m"))?;
-    tmux_color(&window, color, name)?;
+    tmux_rename(&window, name)?;
     sh(Command::new("tmux").arg("select-pane").arg("-t").arg(left))?;
     sh(Command::new("tmux")
         .arg("select-window")
@@ -527,12 +638,28 @@ fn tmux_color(window: &str, color: &str, name: &str) -> Result<()> {
         .arg(window)
         .arg("window-status-current-style")
         .arg(format!("fg={color},bold")))?;
+    tmux_rename(window, name)?;
+    Ok(())
+}
+
+fn tmux_rename(window: &str, name: &str) -> Result<()> {
     sh(Command::new("tmux")
         .arg("rename-window")
         .arg("-t")
         .arg(window)
         .arg(name))?;
     Ok(())
+}
+
+fn tmux_windows() -> Result<Vec<String>> {
+    Ok(out(Command::new("tmux")
+        .arg("list-windows")
+        .arg("-a")
+        .arg("-F")
+        .arg("#{window_id}"))?
+    .lines()
+    .map(str::to_string)
+    .collect())
 }
 
 fn find_window(window: &str) -> Result<Option<(PathBuf, State, String)>> {
@@ -611,6 +738,10 @@ fn clean_name(s: &str) -> String {
             }
         })
         .collect()
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn hash(s: &str) -> u64 {
