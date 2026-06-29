@@ -4,7 +4,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -97,7 +97,12 @@ fn parse_agent(args: &[String]) -> Result<Option<String>> {
 fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
     require_tmux()?;
     let repo = repo()?;
+    let main_branch = resolve_main_branch(&repo.root, &config.main_branch)?;
     let mut state = load_state(&repo)?;
+    if remove_missing_workspaces(&mut state) {
+        prune_git_worktrees(&repo.root)?;
+        save_state(&repo.state, &state)?;
+    }
     let agent = agent.unwrap_or_else(|| config.default_agent.clone());
     let agent_cmd = config
         .agents
@@ -105,7 +110,8 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
         .ok_or_else(|| format!("unknown agent: {agent}"))?
         .clone();
     let live_windows = tmux_windows()?;
-    let id = next_closed_id(&state, &live_windows);
+    let id = next_workspace_id(&state, &live_windows);
+    let mut should_bootstrap = false;
 
     if !state.workspaces.contains_key(&id) {
         if id == "main" {
@@ -113,7 +119,7 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
             state.workspaces.insert(
                 id.clone(),
                 Workspace {
-                    branch: config.main_branch.clone(),
+                    branch: main_branch.clone(),
                     path: repo.root.clone(),
                     agent: agent.clone(),
                     tmux_window_id: String::new(),
@@ -123,12 +129,8 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
                 },
             );
         } else {
-            create_worktree(&repo, &config.main_branch, &id)?;
-            copy_dotfiles(
-                &repo.root,
-                &repo.parent.join(format!("{}-{}", repo.name, id)),
-                &config.dotfiles,
-            )?;
+            prepare_worktree(&repo, &main_branch, &id, &config.dotfiles)?;
+            should_bootstrap = true;
             let now = now();
             state.workspaces.insert(
                 id.clone(),
@@ -147,14 +149,17 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
 
     let workspace = state.workspaces.get_mut(&id).ok_or("workspace missing")?;
     if id != "main" && !workspace.path.exists() {
-        create_worktree(&repo, &config.main_branch, &id)?;
+        prepare_worktree(&repo, &main_branch, &id, &config.dotfiles)?;
+        should_bootstrap = true;
         workspace.branch = format!("{}-{}", id, clean_name(&repo.name));
         workspace.path = repo.parent.join(format!("{}-{}", repo.name, id));
-        copy_dotfiles(&repo.root, &workspace.path, &config.dotfiles)?;
     }
 
     let name = format!("{}:{}", id, repo.name);
     let window = tmux_new(&name, &workspace.path, &config.editor, &agent_cmd)?;
+    if should_bootstrap {
+        start_bootstrap(&workspace.path, &window, &name)?;
+    }
     let now = now();
     workspace.agent = agent;
     workspace.tmux_window_id = window.clone();
@@ -194,12 +199,13 @@ fn cmd_list() -> Result<()> {
 
 fn cmd_refresh(config: &Config) -> Result<()> {
     let repo = repo()?;
+    let main_branch = resolve_main_branch(&repo.root, &config.main_branch)?;
     let state = read_state_file(&repo.state)?;
     for (id, w) in state.workspaces {
         if id == "main" {
             continue;
         }
-        println!("refreshing {id}: {} <- {}", w.branch, config.main_branch);
+        println!("refreshing {id}: {} <- {}", w.branch, main_branch);
         sh(Command::new("git")
             .arg("-C")
             .arg(&w.path)
@@ -209,7 +215,14 @@ fn cmd_refresh(config: &Config) -> Result<()> {
             .arg("-C")
             .arg(&w.path)
             .arg("merge")
-            .arg(&config.main_branch))?;
+            .arg(&main_branch))?;
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&w.path)
+            .arg("push")
+            .arg("-u")
+            .arg("origin")
+            .arg(&w.branch))?;
     }
     Ok(())
 }
@@ -449,15 +462,16 @@ fn save_state(path: &Path, state: &State) -> Result<()> {
     Ok(())
 }
 
-fn next_closed_id(state: &State, live_windows: &[String]) -> String {
+fn next_workspace_id(state: &State, live_windows: &[String]) -> String {
     if !workspace_is_open(state.workspaces.get("main"), live_windows) {
         return "main".into();
     }
 
     for n in 1.. {
         let id = format!("wt{n}");
-        if !workspace_is_open(state.workspaces.get(&id), live_windows) {
-            return id;
+        match state.workspaces.get(&id) {
+            Some(workspace) if workspace_is_open(Some(workspace), live_windows) => {}
+            _ => return id,
         }
     }
     unreachable!()
@@ -467,6 +481,22 @@ fn workspace_is_open(workspace: Option<&Workspace>, live_windows: &[String]) -> 
     workspace
         .map(|w| live_windows.contains(&w.tmux_window_id))
         .unwrap_or(false)
+}
+
+fn remove_missing_workspaces(state: &mut State) -> bool {
+    let before = state.workspaces.len();
+    state
+        .workspaces
+        .retain(|id, workspace| id == "main" || workspace.path.exists());
+    state.workspaces.len() != before
+}
+
+fn prune_git_worktrees(repo: &Path) -> Result<()> {
+    sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("worktree")
+        .arg("prune"))
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
@@ -479,6 +509,24 @@ fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
         .arg(format!("refs/heads/{branch}"))
         .status()?
         .success())
+}
+
+fn resolve_main_branch(repo: &Path, configured: &str) -> Result<String> {
+    if configured == "main" || configured == "master" {
+        if branch_exists(repo, "main")? {
+            return Ok("main".into());
+        }
+        if branch_exists(repo, "master")? {
+            return Ok("master".into());
+        }
+        return Err("neither main nor master branch exists".into());
+    }
+
+    if branch_exists(repo, configured)? {
+        return Ok(configured.into());
+    }
+
+    Err(format!("configured main_branch does not exist: {configured}").into())
 }
 
 fn create_worktree(repo: &Repo, main_branch: &str, id: &str) -> Result<()> {
@@ -507,6 +555,90 @@ fn create_worktree(repo: &Repo, main_branch: &str, id: &str) -> Result<()> {
             .arg(&path)
             .arg(main_branch))
     }
+}
+
+fn prepare_worktree(repo: &Repo, main_branch: &str, id: &str, dotfiles: &[String]) -> Result<()> {
+    let path = repo.parent.join(format!("{}-{}", repo.name, id));
+    create_worktree(repo, main_branch, id)?;
+    copy_dotfiles(&repo.root, &path, dotfiles)?;
+    copy_justfiles(&repo.root, &path)?;
+    Ok(())
+}
+
+fn copy_justfiles(repo: &Path, worktree: &Path) -> Result<()> {
+    copy_existing(repo, worktree, "justfile")?;
+    copy_existing(repo, worktree, "Justfile")?;
+    Ok(())
+}
+
+fn copy_existing(repo: &Path, worktree: &Path, name: &str) -> Result<()> {
+    let src = repo.join(name);
+    if src.exists() {
+        copy(&src, &worktree.join(name))?;
+    }
+    Ok(())
+}
+
+fn start_bootstrap(worktree: &Path, window: &str, name: &str) -> Result<()> {
+    if !worktree.join("justfile").exists() && !worktree.join("Justfile").exists() {
+        return Ok(());
+    }
+
+    let log = shell_quote(&worktree.join(".ylam-bootstrap.log").to_string_lossy());
+    let worktree = shell_quote(&worktree.to_string_lossy());
+    let window = shell_quote(window);
+    let name = shell_quote(name);
+    let script = format!(
+        r#"worktree={worktree}
+log={log}
+window={window}
+name={name}
+cd "$worktree" || exit 1
+(
+  i=0
+  while :; do
+    case $((i % 10)) in
+      0) frame="⠋";;
+      1) frame="⠙";;
+      2) frame="⠹";;
+      3) frame="⠸";;
+      4) frame="⠼";;
+      5) frame="⠴";;
+      6) frame="⠦";;
+      7) frame="⠧";;
+      8) frame="⠇";;
+      *) frame="⠏";;
+    esac
+    tmux rename-window -t "$window" "$name:BOOT $frame" 2>/dev/null || exit 0
+    i=$((i + 1))
+    sleep 0.08
+  done
+) &
+spinner=$!
+just bootstrap > "$log" 2>&1
+status=$?
+kill "$spinner" 2>/dev/null
+wait "$spinner" 2>/dev/null
+if [ "$status" -eq 0 ]; then
+  tmux rename-window -t "$window" "$name" 2>/dev/null
+else
+  tmux rename-window -t "$window" "$name:BOOTFAIL" 2>/dev/null
+fi
+"#
+    );
+
+    Command::new("zsh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    println!(
+        "bootstrapping {} in background",
+        worktree.trim_matches('\'')
+    );
+    Ok(())
 }
 
 fn remove_worktree(repo: &Path, w: &Workspace) -> Result<()> {
@@ -763,4 +895,239 @@ fn parse_array(s: &str) -> Vec<String> {
         .map(unquote)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_repo(name: &str, initial_branch: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("ylam-test-{name}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        sh(Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg(initial_branch)
+            .arg(&path))
+        .unwrap();
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .arg("config")
+            .arg("user.name")
+            .arg("Ylam Test"))
+        .unwrap();
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .arg("config")
+            .arg("user.email")
+            .arg("ylam-test@example.com"))
+        .unwrap();
+        fs::write(path.join("README.md"), "test\n").unwrap();
+        sh(Command::new("git").arg("-C").arg(&path).arg("add").arg(".")).unwrap();
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .arg("commit")
+            .arg("-m")
+            .arg("initial"))
+        .unwrap();
+        path
+    }
+
+    fn test_workspace(id: &str, path: PathBuf) -> Workspace {
+        Workspace {
+            branch: format!("{id}-repo"),
+            path,
+            agent: "claude".into(),
+            tmux_window_id: String::new(),
+            status: "created".into(),
+            created_at: "0".into(),
+            updated_at: "0".into(),
+        }
+    }
+
+    fn test_open_workspace(id: &str, path: PathBuf, window: &str) -> Workspace {
+        let mut workspace = test_workspace(id, path);
+        workspace.tmux_window_id = window.into();
+        workspace
+    }
+
+    #[test]
+    fn next_workspace_id_uses_next_unused_worker_id() {
+        let mut state = State {
+            repo_name: "repo".into(),
+            repo_root: PathBuf::from("/tmp/repo"),
+            repo_key: "repo-key".into(),
+            worktree_root: PathBuf::from("/tmp"),
+            workspaces: BTreeMap::new(),
+        };
+
+        state.workspaces.insert(
+            "main".into(),
+            test_open_workspace("main", PathBuf::from("/tmp/repo"), "@1"),
+        );
+        state.workspaces.insert(
+            "wt1".into(),
+            test_open_workspace("wt1", PathBuf::from("/tmp/repo-wt1"), "@2"),
+        );
+        state.workspaces.insert(
+            "wt2".into(),
+            test_open_workspace("wt2", PathBuf::from("/tmp/repo-wt2"), "@3"),
+        );
+
+        assert_eq!(
+            next_workspace_id(&state, &["@1".into(), "@2".into(), "@3".into()]),
+            "wt3"
+        );
+    }
+
+    #[test]
+    fn next_workspace_id_reopens_first_closed_workspace() {
+        let mut state = State {
+            repo_name: "repo".into(),
+            repo_root: PathBuf::from("/tmp/repo"),
+            repo_key: "repo-key".into(),
+            worktree_root: PathBuf::from("/tmp"),
+            workspaces: BTreeMap::new(),
+        };
+
+        state.workspaces.insert(
+            "main".into(),
+            test_open_workspace("main", PathBuf::from("/tmp/repo"), "@1"),
+        );
+        state.workspaces.insert(
+            "wt1".into(),
+            test_open_workspace("wt1", PathBuf::from("/tmp/repo-wt1"), "@2"),
+        );
+        state.workspaces.insert(
+            "wt2".into(),
+            test_open_workspace("wt2", PathBuf::from("/tmp/repo-wt2"), "@3"),
+        );
+
+        assert_eq!(
+            next_workspace_id(&state, &["@1".into(), "@3".into()]),
+            "wt1"
+        );
+    }
+
+    #[test]
+    fn next_workspace_id_reopens_main_before_workers() {
+        let mut state = State {
+            repo_name: "repo".into(),
+            repo_root: PathBuf::from("/tmp/repo"),
+            repo_key: "repo-key".into(),
+            worktree_root: PathBuf::from("/tmp"),
+            workspaces: BTreeMap::new(),
+        };
+
+        state.workspaces.insert(
+            "main".into(),
+            test_open_workspace("main", PathBuf::from("/tmp/repo"), "@1"),
+        );
+        state.workspaces.insert(
+            "wt1".into(),
+            test_open_workspace("wt1", PathBuf::from("/tmp/repo-wt1"), "@2"),
+        );
+
+        assert_eq!(next_workspace_id(&state, &["@2".into()]), "main");
+    }
+
+    #[test]
+    fn remove_missing_workspaces_keeps_main_and_drops_deleted_workers() {
+        let root = env::temp_dir().join(format!("ylam-state-test-{}", now()));
+        let existing_worker = root.join("repo-wt2");
+        fs::create_dir_all(&existing_worker).unwrap();
+
+        let mut state = State {
+            repo_name: "repo".into(),
+            repo_root: root.join("repo"),
+            repo_key: "repo-key".into(),
+            worktree_root: root.clone(),
+            workspaces: BTreeMap::new(),
+        };
+
+        state.workspaces.insert(
+            "main".into(),
+            test_open_workspace("main", root.join("repo-missing-but-main"), "@1"),
+        );
+        state.workspaces.insert(
+            "wt1".into(),
+            test_workspace("wt1", root.join("repo-wt1-missing")),
+        );
+        state.workspaces.insert(
+            "wt2".into(),
+            test_open_workspace("wt2", existing_worker.clone(), "@2"),
+        );
+
+        assert!(remove_missing_workspaces(&mut state));
+        assert!(state.workspaces.contains_key("main"));
+        assert!(!state.workspaces.contains_key("wt1"));
+        assert!(state.workspaces.contains_key("wt2"));
+        assert_eq!(
+            next_workspace_id(&state, &["@1".into(), "@2".into()]),
+            "wt1"
+        );
+    }
+
+    #[test]
+    fn resolve_main_branch_uses_main_when_both_main_and_master_exist() {
+        let repo = temp_repo("both", "main");
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("branch")
+            .arg("master"))
+        .unwrap();
+
+        assert_eq!(resolve_main_branch(&repo, "main").unwrap(), "main");
+        assert_eq!(resolve_main_branch(&repo, "master").unwrap(), "main");
+    }
+
+    #[test]
+    fn resolve_main_branch_falls_back_to_master() {
+        let repo = temp_repo("master", "master");
+
+        assert_eq!(resolve_main_branch(&repo, "main").unwrap(), "master");
+    }
+
+    #[test]
+    fn resolve_main_branch_keeps_custom_configured_branch() {
+        let repo = temp_repo("custom", "develop");
+
+        assert_eq!(resolve_main_branch(&repo, "develop").unwrap(), "develop");
+    }
+
+    #[test]
+    fn prepare_worktree_copies_justfile_and_dotfiles() {
+        let root = temp_repo("bootstrap", "main");
+        fs::write(
+            root.join("justfile"),
+            "bootstrap:\n\tcp .env bootstrap.env\n",
+        )
+        .unwrap();
+        fs::write(root.join(".env"), "TOKEN=test\n").unwrap();
+
+        let repo = Repo {
+            name: root.file_name().unwrap().to_string_lossy().into_owned(),
+            root: root.clone(),
+            key: "test".into(),
+            state: root.join(".state"),
+            parent: root.parent().unwrap().to_path_buf(),
+        };
+
+        prepare_worktree(&repo, "main", "wt1", &[".env".into()]).unwrap();
+
+        let worktree = repo.parent.join(format!("{}-wt1", repo.name));
+        assert!(worktree.join("justfile").exists());
+        assert_eq!(
+            fs::read_to_string(worktree.join(".env")).unwrap(),
+            "TOKEN=test\n"
+        );
+    }
 }
