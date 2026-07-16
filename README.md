@@ -22,7 +22,7 @@ If the file does not exist, Ylam uses its built-in defaults.
 default_agent = "codex"
 editor = "nvim"
 main_branch = "main"
-new_command = "just bootstrap"
+new_command = ""
 close_strategy = "squash"
 
 [dotfiles]
@@ -56,6 +56,12 @@ command = "codex"
 | `tmux.attention_color` | `"yellow"` | Tmux tab color used when an agent needs attention or permission. |
 | `tmux.failed_color` | `"red"` | Tmux tab color used for failed agent events. |
 | `agents.NAME.command` | `"claude"` and `"codex"` | Command started in the right tmux pane for the named agent. Additional agent names can be added with more sections. |
+
+To opt into a setup command for newly created worker worktrees, set it explicitly:
+
+```toml
+new_command = "just bootstrap"
+```
 
 ### Close strategies
 
