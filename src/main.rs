@@ -4,7 +4,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -13,6 +13,9 @@ struct Config {
     default_agent: String,
     editor: String,
     main_branch: String,
+    new_command: Option<String>,
+    close_strategy: String,
+    close_key: Option<String>,
     dotfiles: Vec<String>,
     done_color: String,
     attention_color: String,
@@ -46,6 +49,29 @@ struct Workspace {
     updated_at: String,
 }
 
+#[derive(Clone, Copy)]
+enum CloseStrategy {
+    Merge,
+    Rebase,
+    Squash,
+    PrAdminMerge,
+}
+
+impl CloseStrategy {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "merge" => Ok(Self::Merge),
+            "rebase" => Ok(Self::Rebase),
+            "squash" => Ok(Self::Squash),
+            "pr-admin-merge" => Ok(Self::PrAdminMerge),
+            _ => Err(format!(
+                "unknown close_strategy: {value} (expected merge, rebase, squash, or pr-admin-merge)"
+            )
+            .into()),
+        }
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -59,6 +85,7 @@ fn run() -> Result<()> {
 
     match args.get(1).map(String::as_str) {
         Some("new") => cmd_new(&config, parse_agent(&args)?),
+        Some("close") => cmd_close(&config, parse_close_window(&args)?),
         Some("list") => cmd_list(),
         Some("refresh") => cmd_refresh(&config),
         Some("event") => cmd_event(&config, args.get(2).ok_or("missing event")?),
@@ -74,6 +101,7 @@ fn run() -> Result<()> {
 fn print_help() {
     println!("ylam");
     println!("  ylam new [--agent claude|codex]");
+    println!("  ylam close");
     println!("  ylam list");
     println!("  ylam refresh");
     println!("  ylam event <event>");
@@ -94,6 +122,20 @@ fn parse_agent(args: &[String]) -> Result<Option<String>> {
     Ok(agent)
 }
 
+fn parse_close_window(args: &[String]) -> Result<Option<String>> {
+    let mut window = None;
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--window" {
+            window = Some(args.get(i + 1).ok_or("missing value for --window")?.clone());
+            i += 2;
+        } else {
+            return Err(format!("unknown option: {}", args[i]).into());
+        }
+    }
+    Ok(window)
+}
+
 fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
     require_tmux()?;
     let repo = repo()?;
@@ -111,7 +153,7 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
         .clone();
     let live_windows = tmux_windows()?;
     let id = next_workspace_id(&state, &live_windows);
-    let mut should_bootstrap = false;
+    let mut should_run_new_command = false;
 
     if !state.workspaces.contains_key(&id) {
         if id == "main" {
@@ -130,7 +172,7 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
             );
         } else {
             prepare_worktree(&repo, &main_branch, &id, &config.dotfiles)?;
-            should_bootstrap = true;
+            should_run_new_command = true;
             let now = now();
             state.workspaces.insert(
                 id.clone(),
@@ -150,15 +192,23 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
     let workspace = state.workspaces.get_mut(&id).ok_or("workspace missing")?;
     if id != "main" && !workspace.path.exists() {
         prepare_worktree(&repo, &main_branch, &id, &config.dotfiles)?;
-        should_bootstrap = true;
+        should_run_new_command = true;
         workspace.branch = format!("{}-{}", id, clean_name(&repo.name));
         workspace.path = repo.parent.join(format!("{}-{}", repo.name, id));
     }
 
     let name = format!("{}:{}", id, repo.name);
-    let window = tmux_new(&name, &workspace.path, &config.editor, &agent_cmd)?;
-    if should_bootstrap {
-        start_bootstrap(&workspace.path, &window, &name)?;
+    let window = tmux_new(
+        &name,
+        &workspace.path,
+        &config.editor,
+        &agent_cmd,
+        config.close_key.as_deref(),
+    )?;
+    if should_run_new_command {
+        if let Some(command) = &config.new_command {
+            start_new_command(&workspace.path, &window, &name, command)?;
+        }
     }
     let now = now();
     workspace.agent = agent;
@@ -252,6 +302,323 @@ fn cmd_remove(target: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_close(config: &Config, window: Option<String>) -> Result<()> {
+    require_tmux()?;
+    let window = match window {
+        Some(window) => window,
+        None => out(Command::new("tmux")
+            .arg("display-message")
+            .arg("-p")
+            .arg("#{window_id}"))?,
+    };
+    let (state_path, mut state, id) =
+        find_window(&window)?.ok_or_else(|| format!("no workspace for tmux window {window}"))?;
+    let name = format!("{}:{}", id, state.repo_name);
+
+    if id == "main" {
+        let message = "the main Ylam window cannot be closed with ylam close";
+        tmux_message(message)?;
+        return Err(message.into());
+    }
+
+    let strategy = match CloseStrategy::parse(&config.close_strategy) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            tmux_message(&format!("ylam close failed: {error}"))?;
+            return Err(error);
+        }
+    };
+    let workspace = state.workspaces.get(&id).ok_or("workspace missing")?;
+    let branch = workspace.branch.clone();
+    let worktree = workspace.path.clone();
+    let preflight = (|| {
+        let main_branch = resolve_main_branch(&state.repo_root, &config.main_branch)?;
+        validate_close_worktrees(&state.repo_root, &main_branch, &worktree, &branch)?;
+        Ok(main_branch)
+    })();
+    let main_branch = match preflight {
+        Ok(main_branch) => main_branch,
+        Err(error) => {
+            let _ = tmux_message(&format!("ylam close failed: {error}"));
+            return Err(error);
+        }
+    };
+
+    let mut spinner = start_close_spinner(&window, &name)?;
+    let result = (|| {
+        integrate_workspace(strategy, &state.repo_root, &main_branch, &worktree, &branch)?;
+        let workspace = state.workspaces.get(&id).ok_or("workspace missing")?;
+        remove_worktree(&state.repo_root, workspace)?;
+        state.workspaces.remove(&id);
+        save_state(&state_path, &state)?;
+        Ok(())
+    })();
+    stop_spinner(&mut spinner);
+
+    if let Err(error) = result {
+        let message = format!("ylam close failed: {error}");
+        let _ = tmux_rename(&window, &format!("{name}:CLOSEFAIL"));
+        let _ = tmux_message(&message);
+        return Err(error);
+    }
+
+    sh(Command::new("tmux")
+        .arg("kill-window")
+        .arg("-t")
+        .arg(&window))?;
+    println!("closed {id} after integrating {branch} into {main_branch}");
+    Ok(())
+}
+
+fn validate_close_worktrees(
+    repo: &Path,
+    main_branch: &str,
+    worktree: &Path,
+    worker_branch: &str,
+) -> Result<()> {
+    let checked_out_main = out(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("branch")
+        .arg("--show-current"))?;
+    if checked_out_main != main_branch {
+        return Err(format!(
+            "main worktree has {checked_out_main} checked out; expected {main_branch}"
+        )
+        .into());
+    }
+
+    let checked_out_worker = out(Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .arg("branch")
+        .arg("--show-current"))?;
+    if checked_out_worker != worker_branch {
+        return Err(format!(
+            "worker worktree has {checked_out_worker} checked out; expected {worker_branch}"
+        )
+        .into());
+    }
+
+    ensure_no_tracked_changes(repo, "main")?;
+    ensure_no_tracked_changes(worktree, "worker")?;
+    Ok(())
+}
+
+fn ensure_no_tracked_changes(repo: &Path, label: &str) -> Result<()> {
+    if git_diff_has_changes(repo, false)? || git_diff_has_changes(repo, true)? {
+        return Err(format!("{label} worktree has uncommitted tracked changes").into());
+    }
+    Ok(())
+}
+
+fn git_diff_has_changes(repo: &Path, cached: bool) -> Result<bool> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).arg("diff");
+    if cached {
+        command.arg("--cached");
+    }
+    let output = command.arg("--quiet").output()?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(String::from_utf8_lossy(&output.stderr).trim().into()),
+    }
+}
+
+fn integrate_workspace(
+    strategy: CloseStrategy,
+    repo: &Path,
+    main_branch: &str,
+    worktree: &Path,
+    worker_branch: &str,
+) -> Result<()> {
+    match strategy {
+        CloseStrategy::Merge => merge_workspace(repo, worker_branch),
+        CloseStrategy::Rebase => rebase_workspace(repo, main_branch, worktree, worker_branch),
+        CloseStrategy::Squash => squash_workspace(repo, worker_branch),
+        CloseStrategy::PrAdminMerge => {
+            pr_admin_merge_workspace(repo, main_branch, worktree, worker_branch)
+        }
+    }
+}
+
+fn merge_workspace(repo: &Path, worker_branch: &str) -> Result<()> {
+    let result = sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("merge")
+        .arg("--no-edit")
+        .arg(worker_branch));
+    if result.is_err() {
+        let _ = sh(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("merge")
+            .arg("--abort"));
+    }
+    result
+}
+
+fn rebase_workspace(
+    repo: &Path,
+    main_branch: &str,
+    worktree: &Path,
+    worker_branch: &str,
+) -> Result<()> {
+    let result = sh(Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .arg("rebase")
+        .arg(main_branch));
+    if let Err(error) = result {
+        let _ = sh(Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .arg("rebase")
+            .arg("--abort"));
+        return Err(error);
+    }
+
+    sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("merge")
+        .arg("--ff-only")
+        .arg(worker_branch))
+}
+
+fn squash_workspace(repo: &Path, worker_branch: &str) -> Result<()> {
+    let squash = sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("merge")
+        .arg("--squash")
+        .arg(worker_branch));
+    if let Err(error) = squash {
+        rollback_squash(repo);
+        return Err(error);
+    }
+    if !git_diff_has_changes(repo, true)? {
+        return Ok(());
+    }
+
+    let commit = sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("commit")
+        .arg("-m")
+        .arg(format!("Squash merge {worker_branch}")));
+    if commit.is_err() {
+        rollback_squash(repo);
+    }
+    commit
+}
+
+fn rollback_squash(repo: &Path) {
+    let _ = sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("reset")
+        .arg("--merge")
+        .arg("HEAD"));
+}
+
+fn pr_admin_merge_workspace(
+    repo: &Path,
+    main_branch: &str,
+    worktree: &Path,
+    worker_branch: &str,
+) -> Result<()> {
+    sh(Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .arg("push")
+        .arg("-u")
+        .arg("origin")
+        .arg(worker_branch))?;
+
+    let open_prs = out(Command::new("gh")
+        .current_dir(repo)
+        .arg("pr")
+        .arg("list")
+        .arg("--state")
+        .arg("open")
+        .arg("--base")
+        .arg(main_branch)
+        .arg("--head")
+        .arg(worker_branch)
+        .arg("--json")
+        .arg("number")
+        .arg("--jq")
+        .arg("length"))?;
+    if open_prs == "0" {
+        sh(Command::new("gh")
+            .current_dir(worktree)
+            .arg("pr")
+            .arg("create")
+            .arg("--base")
+            .arg(main_branch)
+            .arg("--head")
+            .arg(worker_branch)
+            .arg("--fill"))?;
+    }
+
+    sh(Command::new("gh")
+        .current_dir(repo)
+        .arg("pr")
+        .arg("merge")
+        .arg(worker_branch)
+        .arg("--admin")
+        .arg("--merge"))?;
+    sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("fetch")
+        .arg("origin")
+        .arg(main_branch))?;
+    sh(Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("merge")
+        .arg("--ff-only")
+        .arg(format!("origin/{main_branch}")))
+}
+
+fn start_close_spinner(window: &str, name: &str) -> Result<Child> {
+    let window = shell_quote(window);
+    let name = shell_quote(name);
+    let script = format!(
+        r#"window={window}
+name={name}
+i=0
+while :; do
+  case $((i % 4)) in
+    0) frame="◐";;
+    1) frame="◓";;
+    2) frame="◑";;
+    *) frame="◒";;
+  esac
+  tmux rename-window -t "$window" "$name:CLOSE $frame" 2>/dev/null || exit 0
+  i=$((i + 1))
+  sleep 0.12
+done
+"#
+    );
+    Ok(Command::new("zsh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?)
+}
+
+fn stop_spinner(spinner: &mut Child) {
+    let _ = spinner.kill();
+    let _ = spinner.wait();
+}
+
 fn cmd_event(config: &Config, event: &str) -> Result<()> {
     require_tmux()?;
     let window = out(Command::new("tmux")
@@ -299,6 +666,9 @@ fn load_config() -> Config {
         default_agent: "claude".into(),
         editor: "nvim".into(),
         main_branch: "main".into(),
+        new_command: None,
+        close_strategy: "merge".into(),
+        close_key: Some("q".into()),
         dotfiles: vec![
             ".env".into(),
             ".envrc".into(),
@@ -338,7 +708,16 @@ fn load_config() -> Config {
             ("", "default_agent") => c.default_agent = unquote(value),
             ("", "editor") => c.editor = unquote(value),
             ("", "main_branch") => c.main_branch = unquote(value),
+            ("", "new_command") => {
+                let command = unquote(value);
+                c.new_command = (!command.is_empty()).then_some(command);
+            }
+            ("", "close_strategy") => c.close_strategy = unquote(value),
             ("dotfiles", "paths") => c.dotfiles = parse_array(value),
+            ("tmux", "close_key") => {
+                let key = unquote(value);
+                c.close_key = (!key.is_empty()).then_some(key);
+            }
             ("tmux", "done_color") => c.done_color = unquote(value),
             ("tmux", "attention_color") => c.attention_color = unquote(value),
             ("tmux", "failed_color") => c.failed_color = unquote(value),
@@ -579,20 +958,18 @@ fn copy_existing(repo: &Path, worktree: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn start_bootstrap(worktree: &Path, window: &str, name: &str) -> Result<()> {
-    if !worktree.join("justfile").exists() && !worktree.join("Justfile").exists() {
-        return Ok(());
-    }
-
-    let log = shell_quote(&worktree.join(".ylam-bootstrap.log").to_string_lossy());
+fn start_new_command(worktree: &Path, window: &str, name: &str, command: &str) -> Result<()> {
+    let log = shell_quote(&worktree.join(".ylam-new-command.log").to_string_lossy());
     let worktree = shell_quote(&worktree.to_string_lossy());
     let window = shell_quote(window);
     let name = shell_quote(name);
+    let command = shell_quote(command);
     let script = format!(
         r#"worktree={worktree}
 log={log}
 window={window}
 name={name}
+command={command}
 cd "$worktree" || exit 1
 (
   i=0
@@ -615,7 +992,7 @@ cd "$worktree" || exit 1
   done
 ) &
 spinner=$!
-just bootstrap > "$log" 2>&1
+zsh -lc "$command" > "$log" 2>&1
 status=$?
 kill "$spinner" 2>/dev/null
 wait "$spinner" 2>/dev/null
@@ -635,7 +1012,7 @@ fi
         .stderr(Stdio::null())
         .spawn()?;
     println!(
-        "bootstrapping {} in background",
+        "running configured new command in {}",
         worktree.trim_matches('\'')
     );
     Ok(())
@@ -700,7 +1077,13 @@ fn copy(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tmux_new(name: &str, dir: &Path, editor: &str, agent: &str) -> Result<String> {
+fn tmux_new(
+    name: &str,
+    dir: &Path,
+    editor: &str,
+    agent: &str,
+    close_key: Option<&str>,
+) -> Result<String> {
     let window = out(Command::new("tmux")
         .arg("new-window")
         .arg("-P")
@@ -710,6 +1093,7 @@ fn tmux_new(name: &str, dir: &Path, editor: &str, agent: &str) -> Result<String>
         .arg(name)
         .arg("-c")
         .arg(dir))?;
+    configure_close_shortcut(&window, close_key)?;
     let left = out(Command::new("tmux")
         .arg("list-panes")
         .arg("-t")
@@ -748,6 +1132,37 @@ fn tmux_new(name: &str, dir: &Path, editor: &str, agent: &str) -> Result<String>
     Ok(window)
 }
 
+fn configure_close_shortcut(window: &str, close_key: Option<&str>) -> Result<()> {
+    sh(Command::new("tmux")
+        .arg("set-option")
+        .arg("-w")
+        .arg("-t")
+        .arg(window)
+        .arg("@ylam_tracked")
+        .arg("1"))?;
+
+    let Some(close_key) = close_key else {
+        return Ok(());
+    };
+    let executable = env::current_exe()?;
+    let close_command = format!(
+        r##"if [ "#{{@ylam_tracked}}" = "1" ]; then
+  {} close --window "#{{window_id}}"
+else
+  tmux display-panes
+fi"##,
+        shell_quote(&executable.to_string_lossy())
+    );
+    sh(Command::new("tmux")
+        .arg("bind-key")
+        .arg("-T")
+        .arg("prefix")
+        .arg(close_key)
+        .arg("run-shell")
+        .arg("-b")
+        .arg(close_command))
+}
+
 fn tmux_color(window: &str, color: &str, name: &str) -> Result<()> {
     sh(Command::new("tmux")
         .arg("set-option")
@@ -781,6 +1196,10 @@ fn tmux_rename(window: &str, name: &str) -> Result<()> {
         .arg(window)
         .arg(name))?;
     Ok(())
+}
+
+fn tmux_message(message: &str) -> Result<()> {
+    sh(Command::new("tmux").arg("display-message").arg(message))
 }
 
 fn tmux_windows() -> Result<Vec<String>> {
