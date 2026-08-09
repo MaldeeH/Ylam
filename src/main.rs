@@ -39,6 +39,12 @@ struct State {
     workspaces: BTreeMap<String, Workspace>,
 }
 
+struct TmuxWindow {
+    id: String,
+    workspace_key: String,
+    name: String,
+}
+
 struct Workspace {
     branch: String,
     path: PathBuf,
@@ -197,9 +203,10 @@ fn cmd_new(config: &Config, agent: Option<String>) -> Result<()> {
         workspace.path = repo.parent.join(format!("{}-{}", repo.name, id));
     }
 
-    let name = format!("{}:{}", id, repo.name);
+    let name = workspace_window_name(&id, &repo.name);
     let window = tmux_new(
         &name,
+        &workspace_key(&repo.key, &id),
         &workspace.path,
         &config.editor,
         &agent_cmd,
@@ -732,10 +739,7 @@ fn load_config() -> Config {
 }
 
 fn repo() -> Result<Repo> {
-    let root = PathBuf::from(out(Command::new("git")
-        .arg("rev-parse")
-        .arg("--show-toplevel"))?)
-    .canonicalize()?;
+    let root = main_worktree_root(&env::current_dir()?)?;
     let name = root
         .file_name()
         .and_then(OsStr::to_str)
@@ -758,6 +762,29 @@ fn repo() -> Result<Repo> {
         state: base.join("state.txt"),
         parent,
     })
+}
+
+// `git rev-parse --show-toplevel` returns the *current* worktree, so running ylam
+// from inside a worktree would register that worktree as a separate repo. The
+// common git dir always points at the main worktree's .git, for every worktree.
+fn main_worktree_root(dir: &Path) -> Result<PathBuf> {
+    let common = PathBuf::from(out(Command::new("git")
+        .current_dir(dir)
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir"))?);
+    let root = match common.file_name() {
+        Some(name) if name == OsStr::new(".git") => common
+            .parent()
+            .ok_or("git common dir has no parent directory")?
+            .to_path_buf(),
+        // Bare repo or a separate git dir: no main worktree to derive, use the current one.
+        _ => PathBuf::from(out(Command::new("git")
+            .current_dir(dir)
+            .arg("rev-parse")
+            .arg("--show-toplevel"))?),
+    };
+    Ok(root.canonicalize()?)
 }
 
 fn load_state(repo: &Repo) -> Result<State> {
@@ -841,25 +868,50 @@ fn save_state(path: &Path, state: &State) -> Result<()> {
     Ok(())
 }
 
-fn next_workspace_id(state: &State, live_windows: &[String]) -> String {
-    if !workspace_is_open(state.workspaces.get("main"), live_windows) {
+fn next_workspace_id(state: &State, live_windows: &[TmuxWindow]) -> String {
+    if !workspace_is_open(state, "main", live_windows) {
         return "main".into();
     }
 
     for n in 1.. {
         let id = format!("wt{n}");
-        match state.workspaces.get(&id) {
-            Some(workspace) if workspace_is_open(Some(workspace), live_windows) => {}
-            _ => return id,
+        if !workspace_is_open(state, &id, live_windows) {
+            return id;
         }
     }
     unreachable!()
 }
 
-fn workspace_is_open(workspace: Option<&Workspace>, live_windows: &[String]) -> bool {
-    workspace
-        .map(|w| live_windows.contains(&w.tmux_window_id))
-        .unwrap_or(false)
+fn workspace_key(repo_key: &str, id: &str) -> String {
+    format!("{repo_key}:{id}")
+}
+
+fn workspace_window_name(id: &str, repo_name: &str) -> String {
+    format!("{id}:{repo_name}")
+}
+
+// A stored tmux window id is not proof the workspace is still open: tmux restarts
+// its @N counter with the server, so an unrelated window can inherit the id. Also
+// require the window to identify itself as this workspace, via the @ylam_workspace
+// option, or via its name for windows opened by an older ylam.
+fn workspace_is_open(state: &State, id: &str, live_windows: &[TmuxWindow]) -> bool {
+    let Some(workspace) = state.workspaces.get(id) else {
+        return false;
+    };
+    if workspace.tmux_window_id.is_empty() {
+        return false;
+    }
+    let key = workspace_key(&state.repo_key, id);
+    let name = workspace_window_name(id, &state.repo_name);
+    live_windows.iter().any(|window| {
+        window.id == workspace.tmux_window_id
+            && if window.workspace_key.is_empty() {
+                // ylam appends a status marker as `name:MARKER` in cmd_event.
+                window.name == name || window.name.starts_with(&format!("{name}:"))
+            } else {
+                window.workspace_key == key
+            }
+    })
 }
 
 fn remove_missing_workspaces(state: &mut State) -> bool {
@@ -1079,6 +1131,7 @@ fn copy(src: &Path, dst: &Path) -> Result<()> {
 
 fn tmux_new(
     name: &str,
+    workspace_key: &str,
     dir: &Path,
     editor: &str,
     agent: &str,
@@ -1093,6 +1146,13 @@ fn tmux_new(
         .arg(name)
         .arg("-c")
         .arg(dir))?;
+    sh(Command::new("tmux")
+        .arg("set-option")
+        .arg("-w")
+        .arg("-t")
+        .arg(&window)
+        .arg("@ylam_workspace")
+        .arg(workspace_key))?;
     configure_close_shortcut(&window, close_key)?;
     let left = out(Command::new("tmux")
         .arg("list-panes")
@@ -1202,14 +1262,21 @@ fn tmux_message(message: &str) -> Result<()> {
     sh(Command::new("tmux").arg("display-message").arg(message))
 }
 
-fn tmux_windows() -> Result<Vec<String>> {
+fn tmux_windows() -> Result<Vec<TmuxWindow>> {
     Ok(out(Command::new("tmux")
         .arg("list-windows")
         .arg("-a")
         .arg("-F")
-        .arg("#{window_id}"))?
+        .arg("#{window_id}\t#{@ylam_workspace}\t#{window_name}"))?
     .lines()
-    .map(str::to_string)
+    .filter_map(|line| {
+        let mut parts = line.splitn(3, '\t');
+        Some(TmuxWindow {
+            id: parts.next()?.to_string(),
+            workspace_key: parts.next().unwrap_or_default().to_string(),
+            name: parts.next().unwrap_or_default().to_string(),
+        })
+    })
     .collect())
 }
 
@@ -1377,15 +1444,37 @@ mod tests {
         workspace
     }
 
-    #[test]
-    fn next_workspace_id_uses_next_unused_worker_id() {
-        let mut state = State {
+    // A window ylam opened for `id` in the test repo below.
+    fn ylam_window(id: &str, window: &str) -> TmuxWindow {
+        TmuxWindow {
+            id: window.into(),
+            workspace_key: workspace_key("repo-key", id),
+            name: workspace_window_name(id, "repo"),
+        }
+    }
+
+    // A window ylam did not open that happens to hold `window`.
+    fn foreign_window(name: &str, window: &str) -> TmuxWindow {
+        TmuxWindow {
+            id: window.into(),
+            workspace_key: String::new(),
+            name: name.into(),
+        }
+    }
+
+    fn test_state() -> State {
+        State {
             repo_name: "repo".into(),
             repo_root: PathBuf::from("/tmp/repo"),
             repo_key: "repo-key".into(),
             worktree_root: PathBuf::from("/tmp"),
             workspaces: BTreeMap::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn next_workspace_id_uses_next_unused_worker_id() {
+        let mut state = test_state();
 
         state.workspaces.insert(
             "main".into(),
@@ -1401,20 +1490,21 @@ mod tests {
         );
 
         assert_eq!(
-            next_workspace_id(&state, &["@1".into(), "@2".into(), "@3".into()]),
+            next_workspace_id(
+                &state,
+                &[
+                    ylam_window("main", "@1"),
+                    ylam_window("wt1", "@2"),
+                    ylam_window("wt2", "@3"),
+                ]
+            ),
             "wt3"
         );
     }
 
     #[test]
     fn next_workspace_id_reopens_first_closed_workspace() {
-        let mut state = State {
-            repo_name: "repo".into(),
-            repo_root: PathBuf::from("/tmp/repo"),
-            repo_key: "repo-key".into(),
-            worktree_root: PathBuf::from("/tmp"),
-            workspaces: BTreeMap::new(),
-        };
+        let mut state = test_state();
 
         state.workspaces.insert(
             "main".into(),
@@ -1430,20 +1520,17 @@ mod tests {
         );
 
         assert_eq!(
-            next_workspace_id(&state, &["@1".into(), "@3".into()]),
+            next_workspace_id(
+                &state,
+                &[ylam_window("main", "@1"), ylam_window("wt2", "@3")]
+            ),
             "wt1"
         );
     }
 
     #[test]
     fn next_workspace_id_reopens_main_before_workers() {
-        let mut state = State {
-            repo_name: "repo".into(),
-            repo_root: PathBuf::from("/tmp/repo"),
-            repo_key: "repo-key".into(),
-            worktree_root: PathBuf::from("/tmp"),
-            workspaces: BTreeMap::new(),
-        };
+        let mut state = test_state();
 
         state.workspaces.insert(
             "main".into(),
@@ -1454,7 +1541,41 @@ mod tests {
             test_open_workspace("wt1", PathBuf::from("/tmp/repo-wt1"), "@2"),
         );
 
-        assert_eq!(next_workspace_id(&state, &["@2".into()]), "main");
+        assert_eq!(
+            next_workspace_id(&state, &[ylam_window("wt1", "@2")]),
+            "main"
+        );
+    }
+
+    #[test]
+    fn next_workspace_id_ignores_foreign_window_reusing_a_stored_id() {
+        let mut state = test_state();
+
+        state.workspaces.insert(
+            "main".into(),
+            test_open_workspace("main", PathBuf::from("/tmp/repo"), "@1"),
+        );
+
+        assert_eq!(
+            next_workspace_id(&state, &[foreign_window("lazygit:repo", "@1")]),
+            "main"
+        );
+    }
+
+    #[test]
+    fn next_workspace_id_accepts_windows_opened_by_an_older_ylam() {
+        let mut state = test_state();
+
+        state.workspaces.insert(
+            "main".into(),
+            test_open_workspace("main", PathBuf::from("/tmp/repo"), "@1"),
+        );
+
+        // No @ylam_workspace option, and cmd_event has appended a status marker.
+        assert_eq!(
+            next_workspace_id(&state, &[foreign_window("main:repo:DONE", "@1")]),
+            "wt1"
+        );
     }
 
     #[test]
@@ -1489,7 +1610,10 @@ mod tests {
         assert!(!state.workspaces.contains_key("wt1"));
         assert!(state.workspaces.contains_key("wt2"));
         assert_eq!(
-            next_workspace_id(&state, &["@1".into(), "@2".into()]),
+            next_workspace_id(
+                &state,
+                &[ylam_window("main", "@1"), ylam_window("wt2", "@2")]
+            ),
             "wt1"
         );
     }
@@ -1520,6 +1644,28 @@ mod tests {
         let repo = temp_repo("custom", "develop");
 
         assert_eq!(resolve_main_branch(&repo, "develop").unwrap(), "develop");
+    }
+
+    #[test]
+    fn main_worktree_root_resolves_from_inside_a_worktree() {
+        let root = temp_repo("worktree-root", "main").canonicalize().unwrap();
+        let worktree = root.parent().unwrap().join(format!(
+            "{}-wt1",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        sh(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg("wt1")
+            .arg(&worktree))
+        .unwrap();
+
+        assert_eq!(main_worktree_root(&worktree).unwrap(), root);
+        assert_eq!(main_worktree_root(&root).unwrap(), root);
+        assert_eq!(main_worktree_root(&root.join(".git")).unwrap(), root);
     }
 
     #[test]
